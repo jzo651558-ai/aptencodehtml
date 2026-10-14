@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gerador NOAA APT</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;padding:18px;background:#101820;color:#edf5fa;font:16px/1.5 Arial,sans-serif}
+main{max-width:760px;margin:auto;background:#1b2a36;border:1px solid #344b5b;border-radius:16px;padding:22px}
+h1{margin-top:0;color:#68d8ff}
+.note{background:#263b49;padding:12px;border-radius:10px}
+label{display:block;margin-top:16px;font-weight:bold}
+input,select,button{width:100%;padding:12px;margin-top:7px;border-radius:8px}
+input,select{background:#101820;color:#fff;border:1px solid #526b7b}
+button{border:0;background:#087fa8;color:white;font-size:16px;font-weight:bold;cursor:pointer}
+button:disabled{opacity:.5;cursor:wait}
+img{display:block;max-width:100%;max-height:320px;object-fit:contain;margin:14px auto;background:#fff}
+#status{white-space:pre-wrap;overflow-wrap:anywhere;color:#9df0b1}
+audio{width:100%;margin-top:12px}
+small{color:#c4d3dc}
+</style>
+</head>
+<body>
+<main>
+<h1>📡 Gerador NOAA APT</h1>
+<p>Transforme uma imagem em um arquivo WAV com estrutura de linhas APT e portadora de áudio AM de 2400 Hz.</p>
+<div class="note"><b>Importante:</b> isto gera um sinal APT de áudio experimental com estrutura de linha e sincronismos básicos. Pode funcionar em decodificadores APT, mas o resultado pode variar conforme o programa. Não transmite por rádio: apenas cria um arquivo WAV.</div>
+
+<label for="file">1. Escolha uma imagem</label>
+<input id="file" type="file" accept="image/*">
+<img id="preview" alt="Prévia da imagem" hidden>
+
+<label for="height">2. Altura de saída (quantidade de linhas)</label>
+<select id="height">
+<option value="120">120 linhas (60 segundos)</option>
+<option value="240" selected>240 linhas (2 minutos)</option>
+<option value="480">480 linhas (4 minutos)</option>
+<option value="720">720 linhas (6 minutos)</option>
+<option value="1440">1440 linhas (12 minutos)</option>
+</select>
+
+<label for="channel">3. Conteúdo dos canais A e B</label>
+<select id="channel">
+<option value="same" selected>Mesma imagem nos dois canais</option>
+<option value="blankB">Imagem no canal A e canal B em branco</option>
+</select>
+
+<button id="generate" disabled>🎵 Gerar WAV APT</button>
+<audio id="player" controls hidden></audio>
+<button id="save" disabled>💾 Salvar WAV</button>
+<p id="status">Escolha uma imagem para começar.</p>
+<small>Parâmetros de áudio: 44.100 Hz, portadora AM de 2400 Hz, 2 linhas por segundo e 2080 elementos por linha.</small>
+</main>
+<script>
+(() => {
+"use strict";
+const fileInput = document.getElementById('file');
+const preview = document.getElementById('preview');
+const generateButton = document.getElementById('generate');
+const saveButton = document.getElementById('save');
+const player = document.getElementById('player');
+const status = document.getElementById('status');
+let sourceImage = null, wavBlob = null, wavUrl = null, previewUrl = null;
+
+const SR = 44100;
+const LINE_RATE = 2;
+const PIXELS_PER_LINE = 2080;
+const CARRIER_HZ = 2400;
+const SAMPLES_PER_LINE = SR / LINE_RATE; // 22050 exactly
+const SECTIONS = {
+  syncA: 39, spaceA: 47, imageA: 909, teleA: 45,
+  syncB: 39, spaceB: 47, imageB: 909, teleB: 45
+};
+// Sum of sections must be exactly 2080 elements.
+const sectionSum = Object.values(SECTIONS).reduce((a,b)=>a+b,0);
+if (sectionSum !== PIXELS_PER_LINE) throw new Error("Estrutura de linha inválida");
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) return;
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = URL.createObjectURL(f);
+  const img = new Image();
+  img.onload = () => {
+    sourceImage = img;
+    preview.src = previewUrl;
+    preview.hidden = false;
+    generateButton.disabled = false;
+    status.textContent = 'Imagem carregada. Pode gerar o WAV.';
+    wavBlob = null;
+    player.hidden = true;
+    saveButton.disabled = true;
+    if (wavUrl) { URL.revokeObjectURL(wavUrl); wavUrl = null; }
+  };
+  img.onerror = () => { status.textContent = 'Não consegui abrir essa imagem.'; };
+  img.src = previewUrl;
+});
+
+function drawGrayscale(width, height) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext('2d', {willReadFrequently:true});
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,width,height);
+  // Preserve the whole picture, adding black bars if its proportions differ.
+  const scale = Math.min(width/sourceImage.width, height/sourceImage.height);
+  const w = Math.max(1, Math.round(sourceImage.width*scale));
+  const h = Math.max(1, Math.round(sourceImage.height*scale));
+  ctx.drawImage(sourceImage, Math.floor((width-w)/2), Math.floor((height-h)/2), w, h);
+  const id = ctx.getImageData(0,0,width,height);
+  for (let i=0; i<id.data.length; i+=4) {
+    const y = Math.round(0.2126*id.data[i] + 0.7152*id.data[i+1] + 0.0722*id.data[i+2]);
+    id.data[i]=id.data[i+1]=id.data[i+2]=y;
+    id.data[i+3]=255;
+  }
+  ctx.putImageData(id,0,0);
+  return ctx.getImageData(0,0,width,height).data;
+}
+function linePixels(imageData, width, y) {
+  const line = new Float32Array(width);
+  for (let x=0; x<width; x++) line[x] = imageData[(y*width+x)*4] / 255;
+  return line;
+}
+function fillSection(target, offset, values) {
+  for (let i=0; i<values.length; i++) target[offset+i] = values[i];
+}
+// Simplified APT sync waveforms represented as alternating black/white levels.
+// The exact channel image and telemetry elements are kept in the standard line layout.
+function makeLine(aLine, bLine, blankB) {
+  const line = new Float32Array(PIXELS_PER_LINE);
+  let p = 0;
+  const sync = new Float32Array(SECTIONS.syncA);
+  // 7.5-cycle-like alternating synchronization pattern, bounded to 39 elements.
+  for (let i=0;i<sync.length;i++) sync[i] = (Math.floor(i*7/39)%2) ? 0.92 : 0.08;
+  fillSection(line,p,sync); p+=SECTIONS.syncA;
+  line.fill(0.08,p,p+SECTIONS.spaceA); p+=SECTIONS.spaceA;
+  fillSection(line,p,aLine); p+=SECTIONS.imageA;
+  // Telemetry wedge area: neutral ramp, not real satellite telemetry.
+  for(let i=0;i<SECTIONS.teleA;i++) line[p+i]=0.12+0.76*(i/(SECTIONS.teleA-1));
+  p+=SECTIONS.teleA;
+  fillSection(line,p,sync); p+=SECTIONS.syncB;
+  line.fill(0.08,p,p+SECTIONS.spaceB); p+=SECTIONS.spaceB;
+  if (blankB) line.fill(0.08,p,p+SECTIONS.imageB);
+  else fillSection(line,p,bLine);
+  p+=SECTIONS.imageB;
+  for(let i=0;i<SECTIONS.teleB;i++) line[p+i]=0.12+0.76*(i/(SECTIONS.teleB-1));
+  p+=SECTIONS.teleB;
+  if (p !== PIXELS_PER_LINE) throw new Error('Linha APT não tem 2080 elementos.');
+  return line;
+}
+function buildAudio(height, channelMode) {
+  const width = SECTIONS.imageA;
+  const data = drawGrayscale(width,height);
+  const totalSamples = height*SAMPLES_PER_LINE;
+  const out = new Float32Array(totalSamples);
+  let sampleIndex = 0, phase = 0;
+  const phaseStep = 2*Math.PI*CARRIER_HZ/SR;
+  const maxSamples = totalSamples;
+  for (let y=0; y<height; y++) {
+    const a = linePixels(data,width,y);
+    const b = channelMode === 'blankB' ? new Float32Array(width) : a;
+    const line = makeLine(a,b,channelMode === 'blankB');
+    // Map each of the 2080 pixels to exactly 22050/2080 samples using
+    // fractional boundaries, avoiding cumulative timing drift.
+    for (let px=0; px<PIXELS_PER_LINE; px++) {
+      const start = Math.round(px*SAMPLES_PER_LINE/PIXELS_PER_LINE);
+      const end = Math.round((px+1)*SAMPLES_PER_LINE/PIXELS_PER_LINE);
+      const level = Math.max(0, Math.min(1, line[px]));
+      for (let j=start; j<end && sampleIndex<maxSamples; j++) {
+        // APT is amplitude modulation: image brightness controls carrier amplitude.
+        out[sampleIndex++] = 0.92*level*Math.sin(phase);
+        phase += phaseStep;
+        if (phase >= 2*Math.PI) phase -= 2*Math.PI;
+      }
+    }
+  }
+  return out;
+}
+function makeWav(samples) {
+  const buffer = new ArrayBuffer(44 + samples.length*2);
+  const view = new DataView(buffer);
+  const putText=(offset,text)=>{for(let i=0;i<text.length;i++)view.setUint8(offset+i,text.charCodeAt(i));};
+  putText(0,'RIFF'); view.setUint32(4,36+samples.length*2,true);
+  putText(8,'WAVE'); putText(12,'fmt '); view.setUint32(16,16,true);
+  view.setUint16(20,1,true); view.setUint16(22,1,true);
+  view.setUint32(24,SR,true); view.setUint32(28,SR*2,true);
+  view.setUint16(32,2,true); view.setUint16(34,16,true);
+  putText(36,'data'); view.setUint32(40,samples.length*2,true);
+  for(let i=0;i<samples.length;i++){
+    const v=Math.max(-1,Math.min(1,samples[i]));
+    view.setInt16(44+i*2,Math.round(v*32767),true);
+  }
+  return new Blob([buffer],{type:'audio/wav'});
+}
+generateButton.addEventListener('click', async () => {
+  if(!sourceImage)return;
+  generateButton.disabled=true; saveButton.disabled=true;
+  status.textContent='Gerando o áudio... mantenha a página aberta.';
+  await new Promise(r=>setTimeout(r,30));
+  try{
+    const height=Number(document.getElementById('height').value);
+    const mode=document.getElementById('channel').value;
+    const samples=buildAudio(height,mode);
+    wavBlob=makeWav(samples);
+    if(wavUrl)URL.revokeObjectURL(wavUrl);
+    wavUrl=URL.createObjectURL(wavBlob);
+    player.src=wavUrl; player.hidden=false; saveButton.disabled=false;
+    status.textContent=`Pronto! ${height} linhas, ${(height/2).toFixed(0)} segundos, ${(wavBlob.size/1024/1024).toFixed(1)} MB. O arquivo foi criado no seu navegador.`;
+  }catch(e){
+    console.error(e); status.textContent='Erro: '+e.message;
+  }finally{generateButton.disabled=false;}
+});
+saveButton.addEventListener('click',()=>{
+  if(!wavBlob||!wavUrl)return;
+  const a=document.createElement('a');a.href=wavUrl;a.download='NOAA_APT.wav';
+  document.body.appendChild(a);a.click();a.remove();
+});
+})();
+</script>
+</body>
+</html>
